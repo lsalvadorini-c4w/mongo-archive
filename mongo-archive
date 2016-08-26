@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+
+if [ -d ../lib ] && [ -w ../lib ]; then
+	LIB_DIR=../lib/bash
+else
+	LIB_DIR=.
+fi
+
+[ ! -d ${LIB_DIR} ] && mkdir -p ${LIB_DIR}
+[ ! -f ${LIB_DIR}/optparse.sh ] && \
+	wget -q -O ${LIB_DIR}/optparse.sh https://github.com/nk412/optparse/raw/master/optparse.bash
+
+[ ! -f ${LIB_DIR}/lib.sh ] && \
+ 	wget -q -O ${LIB_DIR}/lib.sh https://github.com/lorello/lib.sh/raw/master/lib.sh
+
+
+source ${LIB_DIR}/optparse.sh
+source ${LIB_DIR}/lib.sh
+
+optparse.define short=b long=expire-begin desc="The beginning date of the expire period (default: 1 day before retention)" variable=EXP_BEGIN_PERIOD 
+optparse.define short=r long=data-retention desc="The number of days the data should stay online: data older thant this value will be archived" variable=DATA_RETENTION default=180
+optparse.define short=s long=skip-drop desc="Skip documents removal from database, export documents only" variable=SKIP_DROP default=false value=true
+optparse.define short=f long=field-name desc="The field to be used to check for age of data" variable=FIELD_NAME
+optparse.define short=c long=collection variable=MONGO_COLLECTION desc="MongoDB Collection"
+optparse.define short=d long=database variable=MONGO_DB desc="MongoDB Database"
+optparse.define short=h long=host variable=MONGO_HOST desc="MongoDB Host" default=localhost
+optparse.define short=u long=username variable=MONGO_USER desc="MongoDB Username" default=root
+optparse.define short=p long=password variable=MONGO_PASS desc="MongoDB Password"
+optparse.define short=q long=quiet desc="Flag to set quiet mode on"  variable=QUIET_MODE value=true default=false
+optparse.define short=v long=verbose desc="Flag to set verbose mode on" variable=VERBOSE_MODE value=true default=false
+optparse.define short=k long=backup-dir desc="Directory where to store backup files" variable=BACKUP_DIR default='/var/backups'
+optparse.define short=z long=compress variable=COMPRESSION desc="Gzip archived documents" value=true default=false
+optparse.define short=o long=overwrite variable=OVERWRITE desc="Overwrite archive files if existing" value=true default=false
+#optparse.define short= long= variable= desc=""
+#optparse.define short= long= variable= desc=""
+#optparse.define short= long= variable= desc=""
+source $( optparse.build )
+
+
+get_lock
+
+if [ "$VERBOSE_MODE" == "true" ] && [ "$QUIET_MODE" == "true" ]; then
+	log_error "What do you mean with verbose and quiet option at the same time? I don't know, choose one of the two, please."
+	$0 --help
+	exit 1
+fi
+
+if [ "$VERBOSE_MODE" == "true" ]; then
+	LOGLEVEL=$LOGLEVEL_DEBUG
+	log_debug "Log level: verbose"
+fi
+
+if [ "$QUIET_MODE" == "true" ]; then
+	LOGLEVEL=$LOGLEVEL_ERROR
+	log_debug "Log level: error"
+fi
+
+if [ -z "$EXP_BEGIN_PERIOD" ]; then
+	let "DEFAULT_EXPIRING_DAY=$DATA_RETENTION + 1"
+	EXP_BEGIN_PERIOD=$(date --date="$DEFAULT_EXPIRING_DAY days ago" +"%F")
+	log_debug "Missing parameter expire-begin, setting to default (1 day before retention): $EXP_BEGIN_PERIOD"
+fi
+
+if [ -z "$MONGO_DB" ]; then
+	log_error "missing parameter database"
+	$0 --help
+	exit 1
+fi
+
+if [ -z "$MONGO_COLLECTION" ]; then
+	log_error "missing parameter collection"
+	$0 --help
+	exit 1
+fi
+
+#ensure_bin mongo
+#ensure_bin mongoexport
+
+function getArchiveFilename()
+{
+	if [ "x$COMPRESSION" == "xtrue" ]; then
+		echo "${BACKUP_DIR}/${MONGO_DB}-${MONGO_COLLECTION}-${EXPIRING_DAY}.json.gzip"
+	else
+		echo "${BACKUP_DIR}/${MONGO_DB}-${MONGO_COLLECTION}-${EXPIRING_DAY}.json"
+	fi
+}
+
+function docsExport()
+{
+	ARCHIVE=$(getArchiveFilename)
+	if [ "$COMPRESSION" == "true" ]; then
+		mongoexport --quiet --host ${MONGO_HOST} --db ${MONGO_DB} --collection $MONGO_COLLECTION --query "{\"$FIELD_NAME\" : { \"\$gte\" : ${LOWER_LIMIT}, \"\$lte\" : ${UPPER_LIMIT} }}" | gzip > $ARCHIVE
+		EXPORT_LINES=$(zcat $ARCHIVE | wc -l)
+	else
+		mongoexport --quiet --host ${MONGO_HOST} --db ${MONGO_DB} --collection $MONGO_COLLECTION --query "{\"$FIELD_NAME\" : { \"\$gte\" : ${LOWER_LIMIT}, \"\$lte\" : ${UPPER_LIMIT} }}" > $ARCHIVE
+		EXPORT_LINES=$(cat $ARCHIVE | wc -l)
+	fi
+	echo $EXPORT_LINES
+}
+
+function docsDrop()
+{
+	if [ "$SKIP_DROP" == "true" ]; then
+		log "Skip documents removal"
+	else
+		mongoEval "db.${MONGO_COLLECTION}.remove( { \"$FIELD_NAME\": { \"\$gte\" : ${LOWER_LIMIT}, \"\$lte\": ${UPPER_LIMIT} } } )"
+	fi
+}
+
+function mongoEval()
+{
+	MONGO_CMD=$1
+	mongo --quiet ${MONGO_HOST}/${MONGO_DB} --eval "$MONGO_CMD"
+}
+
+
+
+EXPIRING_DAY=$EXP_BEGIN_PERIOD
+EXPIRING_END_DAY=$(date --date="$DATA_RETENTION days ago" +"%F")
+
+if [[ "$EXPIRING_DAY" > "$EXPIRING_END_DAY" ]] || [[ "$EXPIRING_DAY" = "$EXPIRING_END_DAY" ]]; then
+	log_error "Date requested '${EXP_BEGIN_PERIOD}' is inside retention period ($DATA_RETENTION days), please specify a date before $EXPIRING_END_DAY or reduce retention (-r)"
+fi
+
+log_debug "Archiving $MONGO_DB/$MONGO_COLLECTION starting from $EXP_BEGIN_PERIOD, till $EXPIRING_END_DAY on field $FIELD_NAME"
+while [[ "$EXPIRING_DAY" < "$EXPIRING_END_DAY" ]]; do
+	
+	log_debug "Counting expired documents on $EXPIRING_DAY"
+
+	UPPER_LIMIT="$(date -ud "${EXPIRING_DAY} 23:59:59" +%s)000"
+	LOWER_LIMIT="$(date -ud "${EXPIRING_DAY} 00:00:00" +%s)999"
+	
+	log_debug "QUERY: db.${MONGO_COLLECTION}.count( { \"$FIELD_NAME\": { \"\$gte\" : ${LOWER_LIMIT}, \"\$lte\": ${UPPER_LIMIT} } } )"
+	let -i ONLINE_DOCS
+	wait_for_low_load
+	ONLINE_DOCS=$(mongoEval "db.${MONGO_COLLECTION}.count( { \"$FIELD_NAME\": { \"\$gte\" : ${LOWER_LIMIT}, \"\$lte\": ${UPPER_LIMIT} } } )")
+
+	ARCHIVE=$(getArchiveFilename)
+	if [ -f "$ARCHIVE" ]; then
+		if [ "$OVERWRITE" == "true" ]; then
+			rm -f $ARCHIVE
+		else
+			log_error "Skip date $EXPIRING_DAY, archive file '$ARCHIVE' already exists, use -o to force overwrite of existing archives."
+			EXPIRING_DAY=$(date --date "${EXPIRING_DAY} +1 day" +"%F")
+			continue
+	 	fi
+	fi
+
+	if [ ${ONLINE_DOCS} -gt 0 ]; then
+		wait_for_low_load
+		log_debug "Archiving #${ONLINE_DOCS} documents..."
+		EXPORTED_DOCS=$(docsExport)
+		if [ $EXPORTED_DOCS -eq $ONLINE_DOCS ]; then
+			docsDrop
+			log "Documents where '${FIELD_NAME}' is ${EXPIRING_DAY} removed from database & saved in $ARCHIVE"
+		else
+			log_error "Exported documents count is not equal to documents found querying mongodb,\
+				 SKIP dropping documents, please remove the file $ARCHIVE"
+		fi
+	else
+		log_debug "No documents found"
+	fi
+
+	EXPIRING_DAY=$(date --date "${EXPIRING_DAY} +1 day" +"%F")
+
+done
+
+log_debug "Regular end of operations."
