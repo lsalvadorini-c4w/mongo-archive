@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+#
+# Mongo archive utility
+# https://github.com/lsalvadorini-c4w/mongo-archive
+#
 
 if [ -d ../lib ] && [ -w ../lib ]; then
 	LIB_DIR=../lib/bash
