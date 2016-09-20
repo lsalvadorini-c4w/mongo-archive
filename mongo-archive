@@ -21,7 +21,7 @@ fi
 source ${LIB_DIR}/optparse.sh
 source ${LIB_DIR}/lib.sh
 
-optparse.define short=b long=expire-begin desc="The beginning date of the expire period (default: 1 day before retention)" variable=EXP_BEGIN_PERIOD 
+optparse.define short=b long=expire-begin desc="The beginning date of the expire period; the format must be YYYY-MM-DD [default: 1 day before retention]" variable=EXP_BEGIN_PERIOD 
 optparse.define short=r long=data-retention desc="The number of days the data should stay online: data older thant this value will be archived" variable=DATA_RETENTION default=180
 optparse.define short=s long=skip-drop desc="Skip documents removal from database, export documents only" variable=SKIP_DROP default=false value=true
 optparse.define short=f long=field-name desc="The field to be used to check for age of data" variable=FIELD_NAME
@@ -144,7 +144,7 @@ while [[ "$EXPIRING_DAY" < "$EXPIRING_END_DAY" ]]; do
 		if [ "$OVERWRITE" == "true" ]; then
 			rm -f $ARCHIVE
 		else
-			log_error "Skip date $EXPIRING_DAY, archive file '$ARCHIVE' already exists, use -o to force overwrite of existing archives."
+			log_debug "Skip date $EXPIRING_DAY, archive file '$ARCHIVE' already exists, use -o to force overwrite of existing archives."
 			EXPIRING_DAY=$(date --date "${EXPIRING_DAY} +1 day" +"%F")
 			continue
 	 	fi
